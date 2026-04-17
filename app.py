@@ -4,30 +4,47 @@ import json
 import os
 from datetime import timedelta
 
+# Temporal SDK imports: 
+# - activity & workflow decorators map your functions to Temporal concepts.
+# - Client communicates with the Temporal Server.
+# - Worker listens for tasks from the Server and executes your code.
 from temporalio import activity, workflow
 from temporalio.client import Client
 from temporalio.worker import Worker
+
+# Playwright async API for non-blocking browser automation
 from playwright.async_api import async_playwright
 
 # =======================================================================
-# 0. SETUP: Helper to create a dummy input.csv for testing
+# 0. SETUP: Bootstrapping Test Data
 # =======================================================================
 def create_dummy_csv():
+    """
+    Creates a sample CSV file if it doesn't already exist.
+    This guarantees the pipeline has data to process on its first run.
+    Note the 'target_url' column, which is critical for Playwright to avoid 
+    the 'NoneType' crash we saw earlier.
+    """
     if not os.path.exists("input.csv"):
         with open("input.csv", "w", newline="") as f:
             writer = csv.writer(f)
             writer.writerow(["user_id", "action", "target_url"])
-            # Using safe, public example sites for the Playwright test
             writer.writerow(["101", "check_title", "https://example.com"])
             writer.writerow(["102", "check_title", "https://httpbin.org"])
 
 # =======================================================================
-# 1. ACTIVITIES (The "Lambdas" and Automation Workers)
+# 1. ACTIVITIES (The "Workers" doing the non-deterministic heavy lifting)
 # =======================================================================
+# Rule of Thumb: Anything that touches the file system, network, database, 
+# or uses random numbers MUST be an Activity, not a Workflow.
 
 @activity.defn
 async def write_file_activity(data: list) -> str:
-    """Lambda 2: Writes the incoming data to a local file."""
+    """
+    Lambda 2: Saves data to disk.
+    If the hard drive is temporarily full or locked, Temporal will 
+    automatically retry this function based on a retry policy.
+    """
     print(f"[Activity: Write File] Saving {len(data)} records to disk...")
     output_file = "processed_output.json"
     
@@ -35,12 +52,17 @@ async def write_file_activity(data: list) -> str:
         json.dump(data, f, indent=4)
         
     print(f"[Activity: Write File] ✅ Saved to {output_file}")
+    # Returning the file path so the Workflow can pass it to the next step
     return output_file
 
 @activity.defn
 async def read_file_activity(file_path: str) -> list:
-    """Lambda 3: Reads the file. Instead of pushing to an external queue, 
-    we return the data to Temporal so it can queue the Playwright tasks."""
+    """
+    Lambda 3: Reads the file back into memory.
+    Instead of pushing to a separate message queue (like RabbitMQ), 
+    we return the raw data to the Temporal Workflow. Temporal itself 
+    acts as the highly-resilient queue for the next step.
+    """
     print(f"[Activity: Read File] Reading from {file_path}...")
     
     with open(file_path, "r") as f:
@@ -51,34 +73,52 @@ async def read_file_activity(file_path: str) -> list:
 
 @activity.defn
 async def playwright_automation_activity(task_data: dict) -> str:
-    """The Playwright Worker: Triggered by Temporal for each row of data."""
+    """
+    The Playwright Worker: This activity executes the actual browser automation.
+    Because it's wrapped in an @activity.defn, Temporal will catch any 
+    Exceptions (like a network timeout or browser crash) and automatically 
+    re-run this function without crashing the whole pipeline.
+    """
     url = task_data.get('target_url')
     user = task_data.get('user_id')
     
     print(f"\n🚀 [Playwright] Starting browser for User {user} at {url}...")
     
+    # async_playwright() starts the Playwright driver manager safely
     async with async_playwright() as p:
-        # headless=False so you can visually see it working locally
+        # Launching Chromium. headless=False makes the UI visible for debugging.
         browser = await p.chromium.launch(headless=False)
         page = await browser.new_page()
         
         try:
+            # Navigate to the URL provided in the task data
             await page.goto(url)
             title = await page.title()
             print(f"   [Playwright] ✅ Page loaded. Title: '{title}'")
-            await asyncio.sleep(1) # Brief pause just so you can see it
+            
+            # Brief pause for human visual confirmation during local testing
+            await asyncio.sleep(1) 
             
             return f"Success: {url} -> {title}"
+            
         except Exception as e:
+            # If a timeout or navigation error occurs, we print it and RAISE it.
+            # Raising the error is crucial—it signals to Temporal that the 
+            # activity failed so Temporal knows it needs to retry it.
             print(f"   [Playwright] ❌ Error loading {url}: {e}")
-            raise e # Temporal will catch this and retry the activity automatically!
+            raise e 
+            
         finally:
+            # Always close the browser in a 'finally' block. 
+            # This prevents zombie browser processes from eating up your RAM if it crashes.
             await browser.close()
             print(f"🛑 [Playwright] Closed browser for User {user}.\n")
 
 # =======================================================================
 # 2. WORKFLOW (The Orchestrator)
 # =======================================================================
+# Rule of Thumb: Workflows must be strictly deterministic. They only 
+# dictate the *order* of operations, handle timeouts, and manage state.
 
 @workflow.defn
 class E2EAutomationWorkflow:
@@ -87,6 +127,8 @@ class E2EAutomationWorkflow:
         print("\n[Workflow] 🚦 Orchestration Started.")
         
         # Step 1: Write the file
+        # execute_activity schedules the task on the Temporal server.
+        # start_to_close_timeout ensures the workflow doesn't wait forever if the worker hangs.
         file_path = await workflow.execute_activity(
             write_file_activity,
             initial_csv_data,
@@ -101,18 +143,21 @@ class E2EAutomationWorkflow:
         )
         
         # Step 3: Trigger Playwright for every record in the file
-        # Temporal acts as our highly-resilient queue here.
         automation_results = []
         for record in records_to_process:
+            # This loop treats Temporal as the queue. It queues up a Playwright
+            # task for each row in the CSV file safely and durably.
             result = await workflow.execute_activity(
                 playwright_automation_activity,
                 record,
-                # If a website fails to load, Temporal retries for up to 2 minutes
+                # Giving Playwright a generous 2-minute timeout per page load
                 start_to_close_timeout=timedelta(minutes=2) 
             )
             automation_results.append(result)
             
         print("[Workflow] 🏁 Orchestration Complete.")
+        
+        # The workflow finishes when it returns the final aggregated data
         return automation_results
 
 # =======================================================================
@@ -120,10 +165,10 @@ class E2EAutomationWorkflow:
 # =======================================================================
 
 async def main():
-    # 1. Setup dummy data
+    # 1. Setup dummy data for local testing
     create_dummy_csv()
 
-    # 2. "Lambda 1" Logic: Read the initial trigger file
+    # 2. "Lambda 1" Logic: External trigger reading the initial file
     print("[Trigger] Reading input.csv to kick off pipeline...")
     parsed_csv_data = []
     with open("input.csv", "r") as f:
@@ -131,10 +176,12 @@ async def main():
         for row in reader:
             parsed_csv_data.append(row)
 
-    # 3. Connect to local Temporal Server
+    # 3. Connect to local Temporal Server (Ensure `temporal server start-dev` is running)
     client = await Client.connect("localhost:7233")
 
-    # 4. Start the Temporal Worker to listen for jobs
+    # 4. Start the Temporal Worker
+    # The Worker polls the "automation-queue" for tasks.
+    # It must be registered with the exact Workflows and Activities it's allowed to run.
     worker = Worker(
         client,
         task_queue="automation-queue",
@@ -146,25 +193,27 @@ async def main():
         ],
     )
     
-    # Run the worker in the background
+    # Run the worker in the background asynchronously
     worker_task = asyncio.create_task(worker.run())
 
-    # 5. Start the Workflow
+    # 5. Start the Workflow Execution
+    # We pass `parsed_csv_data` as the input argument to the Workflow's `run` method.
     print("[Trigger] Submitting job to Temporal...")
     final_results = await client.execute_workflow(
         E2EAutomationWorkflow.run,
         parsed_csv_data,
-        id="full-e2e-automation-001",
+        id="full-e2e-automation-001", # Unique ID prevents duplicate runs of the same job
         task_queue="automation-queue",
     )
 
+    # 6. Output final aggregated results
     print("\n==================================================")
     print("🎯 PIPELINE FINISHED SUCCESSFULLY")
     print("==================================================")
     for res in final_results:
         print(f" - {res}")
     
-    # Gracefully shut down
+    # Gracefully shut down the background worker process before exiting
     worker_task.cancel()
     try:
         await worker_task
@@ -172,8 +221,10 @@ async def main():
         pass
 
 if __name__ == "__main__":
-    # Prevent Playwright + Asyncio conflicts on Windows
     import sys
+    # Windows-specific fix: Playwright's async model can crash the default 
+    # Windows asyncio event loop when closing browsers. 
+    # Switching to ProactorEventLoopPolicy prevents "Event loop is closed" errors.
     if sys.platform == "win32":
         asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
         
